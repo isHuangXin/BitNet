@@ -690,7 +690,13 @@ if __name__ == "__main__":
         "Llama3-8B-1.58-100B-tokens"        : [[14336, 4096],
                                                [4096, 14336],
                                                [1024, 4096],
-                                               [4096, 4096]] 
+                                               [4096, 4096]],
+        "multilingual-e5-large"             : [[1024, 1024],
+                                               [4096, 1024],
+                                               [1024, 4096]],
+        "multilingual-e5-base"              : [[768, 768],
+                                               [3072, 768],
+                                               [768, 3072]],
     }
 
     parser = argparse.ArgumentParser(description='gen impl')

@@ -13,7 +13,7 @@ from abc import ABC, abstractmethod
 from enum import IntEnum
 from pathlib import Path
 from hashlib import sha256
-from typing import TYPE_CHECKING, Any, Callable, ContextManager, Iterator, Sequence, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Callable, ContextManager, Iterable, Iterator, Sequence, TypeVar, cast
 import configparser
 
 import numpy as np
@@ -1079,6 +1079,264 @@ class BitnetModel(Model):
                 self.gguf_writer.add_tensor(new_name, data, raw_shape=shape, raw_dtype=data_qtype)
                 if i2_scale is not None:
                     self.gguf_writer.add_tensor(new_name + "_scale", i2_scale, raw_dtype=gguf.GGMLQuantizationType.F32)
+
+
+@Model.register("BertModel", "CamembertModel")
+class BertModel(Model):
+    model_arch = gguf.MODEL_ARCH.BERT
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.vocab_size = None
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        self.gguf_writer.add_causal_attention(False)
+
+        # get pooling path
+        pooling_path = None
+        module_path = self.dir_model / "modules.json"
+        if module_path.is_file():
+            with open(module_path, encoding="utf-8") as f:
+                modules = json.load(f)
+            for mod in modules:
+                if mod["type"] == "sentence_transformers.models.Pooling":
+                    pooling_path = mod["path"]
+                    break
+
+        # get pooling type
+        if pooling_path is not None:
+            pooling_config = self.dir_model / pooling_path / "config.json"
+            if pooling_config.is_file():
+                with open(pooling_config, encoding="utf-8") as f:
+                    pooling = json.load(f)
+                if pooling.get("pooling_mode_mean_tokens"):
+                    pooling_type = gguf.PoolingType.MEAN
+                elif pooling.get("pooling_mode_cls_token"):
+                    pooling_type = gguf.PoolingType.CLS
+                else:
+                    pooling_type = gguf.PoolingType.MEAN  # default
+                self.gguf_writer.add_pooling_type(pooling_type)
+            else:
+                # Default to mean pooling for E5 models
+                self.gguf_writer.add_pooling_type(gguf.PoolingType.MEAN)
+        else:
+            # Default to mean pooling
+            self.gguf_writer.add_pooling_type(gguf.PoolingType.MEAN)
+
+    def set_vocab(self):
+        tokens, toktypes, tokpre = self.get_vocab_base()
+        self.vocab_size = len(tokens)
+
+        self.gguf_writer.add_token_type_count(2)
+
+        # convert to phantom space vocab
+        def phantom(tok):
+            if tok.startswith("[") and tok.endswith("]"):
+                return tok
+            if tok.startswith("##"):
+                return tok[2:]
+            return "\u2581" + tok
+        tokens = list(map(phantom, tokens))
+
+        self.gguf_writer.add_tokenizer_model("bert")
+        self.gguf_writer.add_tokenizer_pre(tokpre)
+        self.gguf_writer.add_token_list(tokens)
+        self.gguf_writer.add_token_types(toktypes)
+
+        special_vocab = gguf.SpecialVocab(self.dir_model, n_vocab=len(tokens))
+        special_vocab.add_to_gguf(self.gguf_writer)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        del bid  # unused
+
+        # skip pooler and position_ids
+        if name in ("embeddings.position_ids", "pooler.dense.weight", "pooler.dense.bias"):
+            return []
+
+        return [(self.map_tensor_name(name), data_torch)]
+
+    def write_tensors(self):
+        for name, data_torch in self.get_tensors():
+            # skip attention biases
+            if name.endswith((".attention.masked_bias", ".attention.bias", ".attention.rotary_emb.inv_freq")):
+                continue
+
+            old_dtype = data_torch.dtype
+
+            # convert any unsupported data types to float32
+            if data_torch.dtype not in (torch.float16, torch.float32):
+                data_torch = data_torch.to(torch.float32)
+
+            # extract block id
+            bid = None
+            for part in name.split("."):
+                if part.isdecimal():
+                    bid = int(part)
+                    break
+
+            for new_name, data in ((n, d.squeeze().numpy()) for n, d in self.modify_tensors(data_torch, name, bid)):
+                data: np.ndarray = data
+                data_shape = data.shape
+                n_dims = len(data.shape)
+                data_dtype = data.dtype
+                data_qtype: gguf.GGMLQuantizationType | None = None
+
+                # Determine which tensors stay as f32
+                extra_f32 = any((
+                    n_dims == 1,
+                    new_name.endswith("_norm.weight"),
+                    new_name.endswith("_norm.bias"),
+                ))
+
+                # These tensors must NOT be quantized (embedding, position, type)
+                tensors_f32 = [
+                    gguf.MODEL_TENSOR.TOKEN_EMBD,
+                    gguf.MODEL_TENSOR.POS_EMBD,
+                    gguf.MODEL_TENSOR.TOKEN_TYPES,
+                ]
+                extra_f32 = extra_f32 or any(self.match_model_tensor_name(new_name, key, bid) for key in tensors_f32)
+
+                # 2D weight tensors are candidates for quantization
+                extra_f16 = (name.endswith(".weight") and n_dims >= 2)
+
+                # Determine if this tensor is suitable for ternary quantization
+                suit_i2 = True
+                if extra_f32 or not extra_f16:
+                    suit_i2 = False
+
+                i2_scale = None
+                if self.ftype != gguf.GGMLQuantizationType.F32 and extra_f16 and not extra_f32:
+                    if self.ftype == gguf.GGMLQuantizationType.TL2 and suit_i2:
+                        data, i2_scale = transform_to_tl2(data)
+                        assert data.dtype == np.uint8
+                        assert i2_scale.dtype == np.float32
+                        data_qtype = gguf.GGMLQuantizationType.TL2
+                    else:  # default to float16 for non-quantized tensors
+                        if data_dtype != np.float16:
+                            data = data.astype(np.float16)
+                        data_qtype = gguf.GGMLQuantizationType.F16
+
+                if data_qtype is None:  # by default, convert to float32
+                    if data_dtype != np.float32:
+                        data = data.astype(np.float32)
+                    data_qtype = gguf.GGMLQuantizationType.F32
+
+                shape = data_shape
+                shape_str = f"{{{', '.join(str(n) for n in reversed(shape))}}}"
+                logger.info(f"{new_name}, {old_dtype} --> {data_qtype.name}, shape = {shape_str}")
+
+                self.gguf_writer.add_tensor(new_name, data, raw_shape=shape, raw_dtype=data_qtype)
+                if i2_scale is not None:
+                    self.gguf_writer.add_tensor(new_name + "_scale", i2_scale, raw_dtype=gguf.GGMLQuantizationType.F32)
+
+
+@Model.register("XLMRobertaModel", "XLMRobertaForSequenceClassification")
+class XLMRobertaModel(BertModel):
+    model_arch = gguf.MODEL_ARCH.BERT
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # position embeddings start at pad_token_id + 1
+        if (pad_token_id := self.hparams.get("pad_token_id")) is not None:
+            self._position_offset = 1 + pad_token_id
+            if "max_position_embeddings" in self.hparams:
+                self.hparams["max_position_embeddings"] -= self._position_offset
+        else:
+            self._position_offset = None
+
+    def set_vocab(self):
+        # SentencePiece BPE tokenizer for XLM-RoBERTa
+        os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
+        from sentencepiece import SentencePieceProcessor
+        from sentencepiece import sentencepiece_model_pb2 as model
+
+        tokenizer_path = self.dir_model / 'sentencepiece.bpe.model'
+        if not tokenizer_path.is_file():
+            raise FileNotFoundError(f"File not found: {tokenizer_path}")
+
+        sentencepiece_model = model.ModelProto()
+        sentencepiece_model.ParseFromString(open(tokenizer_path, "rb").read())
+        assert sentencepiece_model.trainer_spec.model_type == 1  # UNIGRAM
+
+        add_prefix = sentencepiece_model.normalizer_spec.add_dummy_prefix
+        remove_whitespaces = sentencepiece_model.normalizer_spec.remove_extra_whitespaces
+        precompiled_charsmap = sentencepiece_model.normalizer_spec.precompiled_charsmap
+
+        tokenizer = SentencePieceProcessor()
+        tokenizer.LoadFromFile(str(tokenizer_path))
+
+        vocab_size = self.hparams.get('vocab_size', tokenizer.vocab_size())
+
+        tokens: list[bytes] = [f"[PAD{i}]".encode("utf-8") for i in range(vocab_size)]
+        scores: list[float] = [-10000.0] * vocab_size
+        toktypes: list[int] = [SentencePieceTokenTypes.UNUSED] * vocab_size
+
+        for token_id in range(tokenizer.vocab_size()):
+            piece = tokenizer.IdToPiece(token_id)
+            text = piece.encode("utf-8")
+            score = tokenizer.GetScore(token_id)
+
+            toktype = SentencePieceTokenTypes.NORMAL
+            if tokenizer.IsUnknown(token_id):
+                toktype = SentencePieceTokenTypes.UNKNOWN
+            elif tokenizer.IsControl(token_id):
+                toktype = SentencePieceTokenTypes.CONTROL
+            elif tokenizer.IsUnused(token_id):
+                toktype = SentencePieceTokenTypes.UNUSED
+            elif tokenizer.IsByte(token_id):
+                toktype = SentencePieceTokenTypes.BYTE
+
+            tokens[token_id] = text
+            scores[token_id] = score
+            toktypes[token_id] = toktype
+
+        if vocab_size > len(tokens):
+            pad_count = vocab_size - len(tokens)
+            for i in range(1, pad_count + 1):
+                tokens.append(bytes(f"[PAD{i}]", encoding="utf-8"))
+                scores.append(-1000.0)
+                toktypes.append(SentencePieceTokenTypes.UNUSED)
+
+        # realign tokens (see HF tokenizer code)
+        tokens = [b'<s>', b'<pad>', b'</s>', b'<unk>'] + tokens[3:-1]
+        scores = [0.0, 0.0, 0.0, 0.0] + scores[3:-1]
+        toktypes = [
+            SentencePieceTokenTypes.CONTROL,
+            SentencePieceTokenTypes.CONTROL,
+            SentencePieceTokenTypes.CONTROL,
+            SentencePieceTokenTypes.UNKNOWN,
+        ] + toktypes[3:-1]
+
+        self.gguf_writer.add_tokenizer_model("t5")
+        self.gguf_writer.add_tokenizer_pre("default")
+        self.gguf_writer.add_token_list(tokens)
+        self.gguf_writer.add_token_scores(scores)
+        self.gguf_writer.add_token_types(toktypes)
+        self.gguf_writer.add_add_space_prefix(add_prefix)
+        self.gguf_writer.add_token_type_count(1)
+        self.gguf_writer.add_remove_extra_whitespaces(remove_whitespaces)
+        if precompiled_charsmap:
+            self.gguf_writer.add_precompiled_charsmap(precompiled_charsmap)
+
+        special_vocab = gguf.SpecialVocab(self.dir_model, n_vocab=len(tokens))
+        special_vocab.add_to_gguf(self.gguf_writer)
+
+        self.gguf_writer.add_add_bos_token(True)
+        self.gguf_writer.add_add_eos_token(True)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # if name starts with "roberta.", remove the prefix
+        if name.startswith("roberta."):
+            name = name[8:]
+
+        # position embeddings start at pad_token_id + 1, chop down the weight tensor
+        if name == "embeddings.position_embeddings.weight":
+            if self._position_offset is not None:
+                data_torch = data_torch[self._position_offset:,:]
+
+        return super().modify_tensors(data_torch, name, bid)
 
 
 ###### CONVERSION LOGIC ######
