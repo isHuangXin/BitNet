@@ -1,15 +1,9 @@
 #!/bin/bash
-# YOCO-U DRAM-Only Benchmark: F16 vs I2_S (flush L3 cache before each run)
+# YOCO-U DRAM-Only Benchmark: F16 vs I2_S
 #
 # Purpose: Determine whether the fast speed is due to small model size or
-#          L3 cache residency. By flushing the CPU cache before each benchmark
-#          run, the model weights must be fetched from DRAM, not L3.
-#
-# Technique:
-#   Allocate and touch a large buffer (2x L3 size = 96 MiB) to evict
-#   any remaining data from L3 cache, then run benchmark with -r 1
-#   so the first run measures cold-cache (DRAM) latency.
-#   NOTE: Does NOT drop OS page cache — safe for shared servers.
+#          L3 cache residency. Uses llama-bench --flush-cache to evict L3
+#          before each repetition, so every rep measures cold-cache (DRAM) latency.
 #
 # Usage: cd /home/huangxin/code_list/BitNet && bash benchmark_yoco_u_DRAM_only_cpu.sh [threads] [numa_node]
 # Examples:
@@ -29,29 +23,12 @@ if [ -n "$NUMA_NODE" ]; then
     CPUS=$(numactl --hardware 2>/dev/null | grep "node $NUMA_NODE cpus:" | sed 's/.*cpus: //')
 fi
 
-# L3 cache size per NUMA node: 48 MiB; we allocate 2x to ensure full eviction
-FLUSH_SIZE_MB=96
-
-flush_l3_cache() {
-    echo "  [flush] Evicting L3 cache (touching ${FLUSH_SIZE_MB} MiB buffer)..."
-    # Allocate a buffer larger than L3 and touch every cache line (64-byte stride)
-    # to ensure all previous L3 contents are evicted
-    python3 -c "
-import ctypes
-size = ${FLUSH_SIZE_MB} * 1024 * 1024
-buf = ctypes.create_string_buffer(size)
-# Touch every cache line (64 bytes) to fully evict L3
-for i in range(0, size, 64):
-    buf[i] = 0x42
-"
-}
-
 F16_SIZE=$(du -h "$F16_MODEL" | cut -f1)
 I2S_SIZE=$(du -h "$I2S_MODEL" | cut -f1)
 
 echo "========================================================"
 echo "  YOCO-U DRAM-Only Benchmark: F16 vs I2_S"
-echo "  L3 cache flushed before each run (cold-cache / DRAM)"
+echo "  L3 cache flushed before each rep (--flush-cache)"
 echo "  Threads: $THREADS"
 [ -n "$NUMA_NODE" ] && echo "  CPU Affinity: NUMA $NUMA_NODE (cores: $CPUS)"
 echo "========================================================"
@@ -62,16 +39,12 @@ echo "  I2_S: $I2S_SIZE"
 echo "  L3 Cache: 48 MiB per NUMA node (will be flushed)"
 echo
 
-flush_l3_cache
-
 echo "--- F16 Benchmark (DRAM, cold cache) ---"
-$TASKSET $BENCH -m $F16_MODEL -t $THREADS -p 128,256,512 -n 128 -r 3 -ngl 0
+$TASKSET $BENCH -m $F16_MODEL -t $THREADS -p 128,256,512 -n 128 -r 3 -ngl 0 --flush-cache
 
 echo
-flush_l3_cache
-
 echo "--- I2_S Benchmark (DRAM, cold cache) ---"
-$TASKSET $BENCH -m $I2S_MODEL -t $THREADS -p 128,256,512 -n 128 -r 3 -ngl 0 || echo "⚠ I2_S crashed."
+$TASKSET $BENCH -m $I2S_MODEL -t $THREADS -p 128,256,512 -n 128 -r 3 -ngl 0 --flush-cache || echo "⚠ I2_S crashed."
 
 echo
 echo "Done."
