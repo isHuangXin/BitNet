@@ -694,8 +694,9 @@ if __name__ == "__main__":
     }
 
     parser = argparse.ArgumentParser(description='gen impl')
-    parser.add_argument('--model',default="input", type=str, dest="model", 
-                        help="choose from bitnet_b1_58-large/bitnet_b1_58-3B/Llama3-8B-1.58-100B-tokens.")
+    parser.add_argument('--model',default="input", type=str, dest="model",
+                        help="choose from bitnet_b1_58-large/bitnet_b1_58-3B/Llama3-8B-1.58-100B-tokens. "
+                             "Use comma to specify multiple models, e.g. 'multilingual-e5-large,multilingual-e5-base'.")
     parser.add_argument('--BM',default="input", type=str,
                         help="block length when cutting one weight (M, K) into M / BM weights (BM, K).")
     parser.add_argument('--BK',default="input", type=str,
@@ -704,7 +705,13 @@ if __name__ == "__main__":
                         help="using simd instructions to compute (bm, 192 / bm) in one block")
     args = parser.parse_args()
 
-    kernel_shapes = ModelShapeDict[args.model]
+    # Support multiple models separated by comma
+    model_names = [m.strip() for m in args.model.split(',')]
+    kernel_shapes = []
+    for model_name in model_names:
+        for shape in ModelShapeDict[model_name]:
+            if shape not in kernel_shapes:
+                kernel_shapes.append(shape)
 
     BM_list = [int(item) for item in args.BM.split(',')]
     BK_list = [int(item) for item in args.BK.split(',')]
