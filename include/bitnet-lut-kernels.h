@@ -642,7 +642,7 @@ int32_t two_qgemm_lut_8192_3072(void* A, void* LUT, void* Scales, void* LUT_Scal
 #pragma unroll
         for (int i = 0; i < BM8192_3072; i++) {
             ((int32_t*)C)[i] += (int32_t)(((int32_t*)CBits)[i + bs * BM8192_3072]);
-            ((float*)C)[i] = (float)(((int32_t*)C)[i]) / ((float*)LUT_Scales)[bs] * ((float*)Scales)[0];
+            ((float*)C)[i] = (float)(((int32_t*)C)[i]) / ((float*)LUT_Scales)[bs] * ((float*)Scales)[i];
         }
     }
   return 0;
@@ -1022,7 +1022,7 @@ int32_t two_qgemm_lut_3072_4096(void* A, void* LUT, void* Scales, void* LUT_Scal
 #pragma unroll
         for (int i = 0; i < BM3072_4096; i++) {
             ((int32_t*)C)[i] += (int32_t)(((int32_t*)CBits)[i + bs * BM3072_4096]);
-            ((float*)C)[i] = (float)(((int32_t*)C)[i]) / ((float*)LUT_Scales)[bs] * ((float*)Scales)[0];
+            ((float*)C)[i] = (float)(((int32_t*)C)[i]) / ((float*)LUT_Scales)[bs] * ((float*)Scales)[i];
         }
     }
   return 0;
@@ -1402,7 +1402,7 @@ int32_t two_qgemm_lut_1280_3072(void* A, void* LUT, void* Scales, void* LUT_Scal
 #pragma unroll
         for (int i = 0; i < BM1280_3072; i++) {
             ((int32_t*)C)[i] += (int32_t)(((int32_t*)CBits)[i + bs * BM1280_3072]);
-            ((float*)C)[i] = (float)(((int32_t*)C)[i]) / ((float*)LUT_Scales)[bs] * ((float*)Scales)[0];
+            ((float*)C)[i] = (float)(((int32_t*)C)[i]) / ((float*)LUT_Scales)[bs] * ((float*)Scales)[i];
         }
     }
   return 0;
@@ -1782,7 +1782,7 @@ int32_t two_qgemm_lut_3072_1280(void* A, void* LUT, void* Scales, void* LUT_Scal
 #pragma unroll
         for (int i = 0; i < BM3072_1280; i++) {
             ((int32_t*)C)[i] += (int32_t)(((int32_t*)CBits)[i + bs * BM3072_1280]);
-            ((float*)C)[i] = (float)(((int32_t*)C)[i]) / ((float*)LUT_Scales)[bs] * ((float*)Scales)[0];
+            ((float*)C)[i] = (float)(((int32_t*)C)[i]) / ((float*)LUT_Scales)[bs] * ((float*)Scales)[i];
         }
     }
   return 0;
@@ -2162,7 +2162,7 @@ int32_t two_qgemm_lut_1024_3072(void* A, void* LUT, void* Scales, void* LUT_Scal
 #pragma unroll
         for (int i = 0; i < BM1024_3072; i++) {
             ((int32_t*)C)[i] += (int32_t)(((int32_t*)CBits)[i + bs * BM1024_3072]);
-            ((float*)C)[i] = (float)(((int32_t*)C)[i]) / ((float*)LUT_Scales)[bs] * ((float*)Scales)[0];
+            ((float*)C)[i] = (float)(((int32_t*)C)[i]) / ((float*)LUT_Scales)[bs] * ((float*)Scales)[i];
         }
     }
   return 0;
@@ -2542,7 +2542,7 @@ int32_t two_qgemm_lut_3072_3072(void* A, void* LUT, void* Scales, void* LUT_Scal
 #pragma unroll
         for (int i = 0; i < BM3072_3072; i++) {
             ((int32_t*)C)[i] += (int32_t)(((int32_t*)CBits)[i + bs * BM3072_3072]);
-            ((float*)C)[i] = (float)(((int32_t*)C)[i]) / ((float*)LUT_Scales)[bs] * ((float*)Scales)[0];
+            ((float*)C)[i] = (float)(((int32_t*)C)[i]) / ((float*)LUT_Scales)[bs] * ((float*)Scales)[i];
         }
     }
   return 0;
@@ -2922,7 +2922,7 @@ int32_t two_qgemm_lut_128_3072(void* A, void* LUT, void* Scales, void* LUT_Scale
 #pragma unroll
         for (int i = 0; i < BM128_3072; i++) {
             ((int32_t*)C)[i] += (int32_t)(((int32_t*)CBits)[i + bs * BM128_3072]);
-            ((float*)C)[i] = (float)(((int32_t*)C)[i]) / ((float*)LUT_Scales)[bs] * ((float*)Scales)[0];
+            ((float*)C)[i] = (float)(((int32_t*)C)[i]) / ((float*)LUT_Scales)[bs] * ((float*)Scales)[i];
         }
     }
   return 0;
@@ -3214,7 +3214,6 @@ void ggml_bitnet_transform_tensor(struct ggml_tensor * tensor) {
 
     int k = tensor->ne[0];
     int m = tensor->ne[1];
-    const int lut_scales_size = 1;
     int bk = 0;
     int bm = 0;
 
@@ -3252,16 +3251,19 @@ else if (m == 128 && k == 3072) {
     uint8_t * qweights;
     bitnet_float_type * scales;
 
-    scales = (bitnet_float_type *) aligned_malloc(sizeof(bitnet_float_type));
     qweights = (uint8_t *) tensor->data;
     int nbytes = (k - 256) * m / 3 * 5 / 8 + 256 * m / 2 * 4 / 8;
     if (nbytes % 32 != 0) nbytes = 32 - nbytes % 32 + nbytes;
     float * i2_scales = (float * )(qweights + nbytes);
-    scales[0] = (bitnet_float_type) i2_scales[0];
+    // Per-row scales: M floats stored after packed ternary bytes
+    scales = (bitnet_float_type *) aligned_malloc(m * sizeof(bitnet_float_type));
+    for (int r = 0; r < m; r++) {
+        scales[r] = (bitnet_float_type) i2_scales[r];
+    }
 
     tensor->extra = bitnet_tensor_extras + bitnet_tensor_extras_index;
     bitnet_tensor_extras[bitnet_tensor_extras_index++] = {
-        /* .lut_scales_size = */ lut_scales_size,
+        /* .lut_scales_size = */ 1,
         /* .BK              = */ BK,
         /* .n_tile_num      = */ n_tile_num,
         /* .qweights        = */ qweights,

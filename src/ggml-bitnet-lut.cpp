@@ -285,7 +285,7 @@ void ggml_bitnet_mul_mat(const struct ggml_compute_params * params, struct ggml_
                            ((uint8_t *)(wt->qweights) + i_tile * w_tile_size), \
                            sign + i_tile * sign_tile_size, \
                            three_qlut + three_qlut_offset + i * (BS) * three_k / 3 * 32, \
-                           wt->scales, \
+                           wt->scales + i_tile * c_tile_size, \
                            lut_scales + lut_scales_offset + i * (BS), \
                            act_output + i_tile * c_tile_size + output_offset + i * (BS) * ne01); \
         } \
@@ -295,7 +295,7 @@ void ggml_bitnet_mul_mat(const struct ggml_compute_params * params, struct ggml_
                                two_A + i_tile * two_w_tile_size, \
                                NULL, \
                                two_qlut + two_qlut_offset + i * (BS) * two_k / 2 * 32, \
-                               wt->scales, \
+                               wt->scales + i_tile * c_tile_size, \
                                lut_scales + lut_scales_offset + i * (BS), \
                                act_output + i_tile * c_tile_size + output_offset + i * (BS) * ne01); \
             } \

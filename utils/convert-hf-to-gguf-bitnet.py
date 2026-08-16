@@ -663,68 +663,110 @@ def preprocess_weights_tl2(
                              weight.shape[0]), mode='constant', constant_values=0)
     return weight
 
-def quantize_to_i2_s(w: np.ndarray, override_scale: float = None) -> np.ndarray:
+def quantize_to_i2_s(w: np.ndarray, override_scale: float = None, per_row: bool = False) -> np.ndarray:
     """Quantize a float weight matrix to I2_S ternary format.
-
-    I2_S format: packed ternary bytes (4 values per byte) + 32-byte tail with f32 scale.
-    Dequantization: y = scale * ternary, where ternary in {-1, 0, +1}.
 
     Args:
         w: float weight tensor of shape (M, K)
-        override_scale: if provided, use this as the I2_S scale instead of computing from data.
-                       For offline-quantized BitNet models, this should be the weight_scale value.
+        override_scale: if provided, use this as the I2_S scale.
+        per_row: if True, use per-row TernarySEQ quantization (for YOCO-MoE models).
+                 if False, use per-tensor scale (legacy, for bitnet_b1_58/Llama3 models).
     """
     M, K = w.shape
     n = M * K
-    w_flat = w.flatten().astype(np.float32)
+    w_f32 = w.astype(np.float32)
 
-    # Compute scale for I2_S dequantization
-    if override_scale is not None:
-        # override_scale is weight_scale from offline-quantized models ≈ mean(|original_bf16_weights|)
-        # Use it directly as the I2_S scale
-        scale = np.float32(override_scale)
-        # Weights are already ternary {-1, 0, 1}, use directly
-        q_float = w_flat
+    if per_row:
+        # Per-row TernarySEQ: round(W[row]/alpha * 1.5) / 1.5
+        row_scales = np.zeros(M, dtype=np.float32)
+        q_flat = np.ones(n, dtype=np.uint8)
+        clip_ratio = 1.0 - 1e-2
+
+        for row in range(M):
+            row_data = w_f32[row, :]
+            if override_scale is not None:
+                alpha = np.float32(override_scale)
+            else:
+                alpha = np.float32(max(np.abs(row_data).max(), 1e-5))
+            row_scales[row] = alpha
+
+            normalized = row_data / alpha
+            normalized = np.clip(normalized, -clip_ratio, clip_ratio)
+            ternary_int = np.round(normalized * 1.5).astype(np.int8)
+            ternary_int = np.clip(ternary_int, -1, 1)
+
+            base = row * K
+            for j in range(K):
+                t = ternary_int[j]
+                if t == -1:
+                    q_flat[base + j] = 0
+                elif t == 0:
+                    q_flat[base + j] = 1
+                else:
+                    q_flat[base + j] = 2
+
+        # Pack
+        pad_len = (128 - n % 128) % 128
+        if pad_len:
+            q_flat = np.pad(q_flat, (0, pad_len), constant_values=1)
+        n_padded = len(q_flat)
+        n_blocks = n_padded // 128
+        q_flat = q_flat.reshape(n_blocks, 4, 32)
+        packed = (q_flat[:, 0, :].astype(np.uint8) << 6) | \
+                 (q_flat[:, 1, :].astype(np.uint8) << 4) | \
+                 (q_flat[:, 2, :].astype(np.uint8) << 2) | \
+                 (q_flat[:, 3, :].astype(np.uint8))
+        packed = packed.reshape(-1).astype(np.uint8)
+
+        # Layout: packed_bytes + M per-row scales (padded to 32 bytes)
+        packed_size = n // 4
+        scales_bytes = M * 4
+        total_size = packed_size + scales_bytes
+        if total_size % 32 != 0:
+            total_size = total_size + (32 - total_size % 32)
+        result = np.zeros(total_size, dtype=np.uint8)
+        result[:packed_size] = packed[:packed_size]
+        result[packed_size:packed_size + scales_bytes] = np.frombuffer(row_scales.tobytes(), dtype=np.uint8)
+        return result
+
     else:
-        # w_flat comes from weight_quant: values are ±scale or 0
-        # Use the first nonzero absolute value as scale (matches C quantize_i2_s)
-        nonzero = np.abs(w_flat[np.abs(w_flat) > 1e-6])
-        if len(nonzero) > 0:
-            scale = np.float32(nonzero[0])
+        # Legacy per-tensor scale
+        w_flat = w_f32.flatten()
+
+        if override_scale is not None:
+            scale = np.float32(override_scale)
+            q_float = w_flat
         else:
-            scale = np.float32(1e-5)
-        # Quantize to ternary {-1, 0, 1}
-        inv_scale = 1.0 / scale
-        q_float = np.round(w_flat * inv_scale).clip(-1, 1)
+            nonzero = np.abs(w_flat[np.abs(w_flat) > 1e-6])
+            if len(nonzero) > 0:
+                scale = np.float32(nonzero[0])
+            else:
+                scale = np.float32(1e-5)
+            inv_scale = 1.0 / scale
+            q_float = np.round(w_flat * inv_scale).clip(-1, 1)
 
-    # Map ternary {-1, 0, 1} -> I2_S encoding {0, 1, 2}
-    q = np.ones(n, dtype=np.uint8)  # default to 1 (zero)
-    q[q_float > 0.5] = 2    # +1 -> 2
-    q[q_float < -0.5] = 0   # -1 -> 0
+        q = np.ones(n, dtype=np.uint8)
+        q[q_float > 0.5] = 2
+        q[q_float < -0.5] = 0
 
-    # Pack into I2_S layout: 128-value blocks, interleaved into 32 bytes
-    pad_len = (128 - n % 128) % 128
-    if pad_len:
-        q = np.pad(q, (0, pad_len), constant_values=1)
+        pad_len = (128 - n % 128) % 128
+        if pad_len:
+            q = np.pad(q, (0, pad_len), constant_values=1)
+        n_padded = len(q)
+        n_blocks = n_padded // 128
+        q = q.reshape(n_blocks, 4, 32)
+        packed = (q[:, 0, :].astype(np.uint8) << 6) | \
+                 (q[:, 1, :].astype(np.uint8) << 4) | \
+                 (q[:, 2, :].astype(np.uint8) << 2) | \
+                 (q[:, 3, :].astype(np.uint8))
+        packed = packed.reshape(-1).astype(np.uint8)
 
-    n_padded = len(q)
-    n_blocks = n_padded // 128
-    q = q.reshape(n_blocks, 4, 32)
-
-    packed = (q[:, 0, :].astype(np.uint8) << 6) | \
-             (q[:, 1, :].astype(np.uint8) << 4) | \
-             (q[:, 2, :].astype(np.uint8) << 2) | \
-             (q[:, 3, :].astype(np.uint8))
-    packed = packed.reshape(-1).astype(np.uint8)
-
-    # I2_S format: packed_bytes + 32-byte aligned tail (scale in first 4 bytes)
-    packed_size = n // 4
-    total_size = packed_size + 32
-    result = np.zeros(total_size, dtype=np.uint8)
-    result[:len(packed)] = packed[:packed_size]
-    result[packed_size:packed_size+4] = np.frombuffer(scale.tobytes(), dtype=np.uint8)
-
-    return result
+        packed_size = n // 4
+        total_size = packed_size + 32
+        result = np.zeros(total_size, dtype=np.uint8)
+        result[:len(packed)] = packed[:packed_size]
+        result[packed_size:packed_size+4] = np.frombuffer(scale.tobytes(), dtype=np.uint8)
+        return result
 
 
 def transform_to_tl1(x: np.ndarray):

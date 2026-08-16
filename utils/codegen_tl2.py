@@ -539,7 +539,7 @@ def gen_tbl_impl(pre, BM, BK, bm, k_list):
     code += '#pragma unroll\n'
     code += '        for (int i = 0; i < BM{}; i++) {{\n'.format(pre)
     code += '            ((int32_t*)C)[i] += (int32_t)(((int32_t*)CBits)[i + bs * BM{}]);\n'.format(pre)
-    code += '            ((float*)C)[i] = (float)(((int32_t*)C)[i]) / ((float*)LUT_Scales)[bs] * ((float*)Scales)[0];\n'
+    code += '            ((float*)C)[i] = (float)(((int32_t*)C)[i]) / ((float*)LUT_Scales)[bs] * ((float*)Scales)[i];\n'
     code += '        }\n'
     code += '    }\n'
     code += '  return 0;\n'
@@ -651,7 +651,6 @@ void ggml_bitnet_transform_tensor(struct ggml_tensor * tensor) {\n\
 \n\
     int k = tensor->ne[0];\n\
     int m = tensor->ne[1];\n\
-    const int lut_scales_size = 1;\n\
     int bk = 0;\n\
     int bm = 0;\n"
 
@@ -673,16 +672,19 @@ void ggml_bitnet_transform_tensor(struct ggml_tensor * tensor) {\n\
     uint8_t * qweights;\n\
     bitnet_float_type * scales;\n\
 \n\
-    scales = (bitnet_float_type *) aligned_malloc(sizeof(bitnet_float_type));\n\
     qweights = (uint8_t *) tensor->data;\n\
     int nbytes = (k - 256) * m / 3 * 5 / 8 + 256 * m / 2 * 4 / 8;\n\
     if (nbytes % 32 != 0) nbytes = 32 - nbytes % 32 + nbytes;\n\
     float * i2_scales = (float * )(qweights + nbytes);\n\
-    scales[0] = (bitnet_float_type) i2_scales[0];\n\
+    // Per-row scales: M floats stored after packed ternary bytes\n\
+    scales = (bitnet_float_type *) aligned_malloc(m * sizeof(bitnet_float_type));\n\
+    for (int r = 0; r < m; r++) {\n\
+        scales[r] = (bitnet_float_type) i2_scales[r];\n\
+    }\n\
 \n\
     tensor->extra = bitnet_tensor_extras + bitnet_tensor_extras_index;\n\
     bitnet_tensor_extras[bitnet_tensor_extras_index++] = {\n\
-        /* .lut_scales_size = */ lut_scales_size,\n\
+        /* .lut_scales_size = */ 1,\n\
         /* .BK              = */ BK,\n\
         /* .n_tile_num      = */ n_tile_num,\n\
         /* .qweights        = */ qweights,\n\
