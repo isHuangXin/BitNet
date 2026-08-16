@@ -276,258 +276,277 @@ static bool is_type_supported(enum ggml_type type) {\n\
 "
     return kernel_code
 
+
+def _gen_avx512_three_inner_block(j):
+    """Generate one unrolled inner block for three_tbl_impl AVX512 version."""
+    return """\
+                __m512i vec_a_{j} = vec_as[k * 4 + {j}];
+                __m128i vec_k1_{j} = _mm_loadu_si128(reinterpret_cast<__m128i*>(lut + k * 32 * 8 + {j} * 64 + 0  + K3 / 3 * 32 * bs));
+                __m128i vec_k2_{j} = _mm_loadu_si128(reinterpret_cast<__m128i*>(lut + k * 32 * 8 + {j} * 64 + 16 + K3 / 3 * 32 * bs));
+                __m128i vec_k3_{j} = _mm_loadu_si128(reinterpret_cast<__m128i*>(lut + k * 32 * 8 + {j} * 64 + 32 + K3 / 3 * 32 * bs));
+                __m128i vec_k4_{j} = _mm_loadu_si128(reinterpret_cast<__m128i*>(lut + k * 32 * 8 + {j} * 64 + 48 + K3 / 3 * 32 * bs));
+                __m512i vec_sign_left_hi_{j} = _mm512_srai_epi16(_mm512_slli_epi16(vec_sign, (4 * {j})), 15);
+                __m512i vec_sign_left_lo_{j} = _mm512_srai_epi16(_mm512_slli_epi16(vec_sign, (4 * {j} + 1)), 15);
+                __m512i vec_v_top_{j} = _mm512_and_si512(_mm512_srli_epi16(vec_a_{j}, 4), vec_mask);
+                __m512i vec_v_top_fir_{j} = _mm512_shuffle_epi8(_mm512_broadcast_i32x4(vec_k1_{j}), vec_v_top_{j});
+                __m512i vec_v_top_sec_{j} = _mm512_shuffle_epi8(_mm512_broadcast_i32x4(vec_k2_{j}), vec_v_top_{j});
+                __m512i vec_sign_right_hi_{j} = _mm512_srai_epi16(_mm512_slli_epi16(vec_sign, (4 * {j} + 2)), 15);
+                __m512i vec_sign_right_lo_{j} = _mm512_srai_epi16(_mm512_slli_epi16(vec_sign, (4 * {j} + 3)), 15);
+                __m512i vec_v_bot_{j} = _mm512_and_si512(vec_a_{j}, vec_mask);
+                __m512i vec_v_bot_fir_{j} = _mm512_shuffle_epi8(_mm512_broadcast_i32x4(vec_k3_{j}), vec_v_bot_{j});
+                __m512i vec_v_bot_sec_{j} = _mm512_shuffle_epi8(_mm512_broadcast_i32x4(vec_k4_{j}), vec_v_bot_{j});
+                __m512i vec_v_top_lo_{j} = _mm512_xor_si512(_mm512_add_epi16(_mm512_unpackhi_epi8(vec_v_top_fir_{j}, vec_v_top_sec_{j}), vec_sign_left_lo_{j}), vec_sign_left_lo_{j});
+                __m512i vec_v_top_hi_{j} = _mm512_xor_si512(_mm512_add_epi16(_mm512_unpacklo_epi8(vec_v_top_fir_{j}, vec_v_top_sec_{j}), vec_sign_left_hi_{j}), vec_sign_left_hi_{j});
+                __m512i vec_v_bot_lo_{j} = _mm512_xor_si512(_mm512_add_epi16(_mm512_unpackhi_epi8(vec_v_bot_fir_{j}, vec_v_bot_sec_{j}), vec_sign_right_lo_{j}), vec_sign_right_lo_{j});
+                __m512i vec_v_bot_hi_{j} = _mm512_xor_si512(_mm512_add_epi16(_mm512_unpacklo_epi8(vec_v_bot_fir_{j}, vec_v_bot_sec_{j}), vec_sign_right_hi_{j}), vec_sign_right_hi_{j});
+                vec_c0 = _mm512_add_epi16(vec_c0, vec_v_top_hi_{j});
+                vec_c0 = _mm512_add_epi16(vec_c0, vec_v_bot_hi_{j});
+                vec_c1 = _mm512_add_epi16(vec_c1, vec_v_top_lo_{j});
+                vec_c1 = _mm512_add_epi16(vec_c1, vec_v_bot_lo_{j});
+""".format(j=j)
+
+
 def gen_tbl_impl(pre, BM, BK, bm, k_list):
+    """Generate three_tbl_impl and two_tbl_impl with AVX512BW main loop + AVX2 tail."""
 
-    kernel_code = "\
-#include <immintrin.h>\n\
-\n\
-#define BM{0} {1}\n\
-#define BBK{0} {2}\n\
-template<int batch_size, int K3>\n\
-inline void three_tbl_impl_{0}(int32_t* c, int8_t* lut, uint8_t* a, uint8_t* sign) {{\n\
-".format(pre, BM, BK)
+    # --- three_tbl_impl ---
+    code = '#include <immintrin.h>\n\n'
+    code += '#define BM{} {}\n'.format(pre, BM)
+    code += '#define BBK{} {}\n'.format(pre, BK)
+    code += 'template<int batch_size, int K3>\n'
+    code += 'inline void three_tbl_impl_{}(int32_t* c, int8_t* lut, uint8_t* a, uint8_t* sign) {{\n'.format(pre)
 
-    kernel_code = "".join([kernel_code, "\
-#ifdef __AVX2__\n\
-    const __m256i vec_mask = _mm256_set1_epi8(0x0f);\n\
-    const __m256i vec_sign_mask  = _mm256_set1_epi16(0x8000);\n\
-    const __m256i vec_zero  = _mm256_set1_epi8(0x00);\n\
-    const __m256i vec_one  = _mm256_set1_epi8(0xff);\n\
-    const int KK = BBK{0} / 3;\n\
-#pragma unroll\n\
-        for (int i = 0; i < BM{0}; i += 32) {{\n\
-        __m256i vec_as[KK / 2];\n\
-        __m256i vec_signs[KK / 8];\n\
-        #pragma unroll\n\
-        for (int ai = 0; ai < KK / 2; ai++) {{\n\
-            vec_as[ai] = _mm256_loadu_si256(reinterpret_cast<__m256i*>(a + i * KK / 2 + ai * 32));\n\
-        }}\n\
-        #pragma unroll\n\
-        for (int as = 0; as < KK / 8; as++) {{\n\
-            vec_signs[as] = _mm256_loadu_si256(reinterpret_cast<__m256i*>(sign + i * KK / 8 + as * 32));\n\
-        }}\n\
-#pragma unroll\n\
-    for (int bs = 0; bs < batch_size; bs++) {{\n\
-        __m256i vec_c0 = _mm256_setzero_si256();\n\
-        __m256i vec_c1 = _mm256_setzero_si256();\n\
-#pragma unroll\n\
-        for (int k = 0; k < KK / 8; k++) {{\n\
-            __m256i vec_sign = vec_signs[k];\n\
-                __m256i vec_a_0 = vec_as[k * 4 + 0];\n\
-                __m128i vec_k1_0 = _mm_loadu_si128(reinterpret_cast<__m128i*>(lut + k * 32 * 8 + 0 * 64 + 0  + K3 / 3 * 32 * bs));\n\
-                __m128i vec_k2_0 = _mm_loadu_si128(reinterpret_cast<__m128i*>(lut + k * 32 * 8 + 0 * 64 + 16 + K3 / 3 * 32 * bs));\n\
-                __m128i vec_k3_0 = _mm_loadu_si128(reinterpret_cast<__m128i*>(lut + k * 32 * 8 + 0 * 64 + 32 + K3 / 3 * 32 * bs));\n\
-                __m128i vec_k4_0 = _mm_loadu_si128(reinterpret_cast<__m128i*>(lut + k * 32 * 8 + 0 * 64 + 48 + K3 / 3 * 32 * bs));\n\
-                __m256i vec_sign_left_hi_0 = _mm256_srai_epi16(_mm256_slli_epi16(vec_sign, (4 * 0)), 15);\n\
-                __m256i vec_sign_left_lo_0 = _mm256_srai_epi16(_mm256_slli_epi16(vec_sign, (4 * 0 + 1)), 15);\n\
-                __m256i vec_v_top_0 = _mm256_and_si256(_mm256_srli_epi16(vec_a_0, 4), vec_mask);\n\
-                __m256i vec_v_top_fir_0 = _mm256_shuffle_epi8(_mm256_set_m128i(vec_k1_0, vec_k1_0), vec_v_top_0);\n\
-                __m256i vec_v_top_sec_0 = _mm256_shuffle_epi8(_mm256_set_m128i(vec_k2_0, vec_k2_0), vec_v_top_0);\n\
-                __m256i vec_sign_right_hi_0 = _mm256_srai_epi16(_mm256_slli_epi16(vec_sign, (4 * 0 + 2)), 15);\n\
-                __m256i vec_sign_right_lo_0 = _mm256_srai_epi16(_mm256_slli_epi16(vec_sign, (4 * 0 + 3)), 15);\n\
-                __m256i vec_v_bot_0 = _mm256_and_si256(vec_a_0, vec_mask);\n\
-                __m256i vec_v_bot_fir_0 = _mm256_shuffle_epi8(_mm256_set_m128i(vec_k3_0, vec_k3_0), vec_v_bot_0);\n\
-                __m256i vec_v_bot_sec_0 = _mm256_shuffle_epi8(_mm256_set_m128i(vec_k4_0, vec_k4_0), vec_v_bot_0);\n\
-                __m256i vec_v_top_lo_0 = _mm256_xor_si256(_mm256_add_epi16(_mm256_unpackhi_epi8(vec_v_top_fir_0, vec_v_top_sec_0), vec_sign_left_lo_0), vec_sign_left_lo_0);\n\
-                __m256i vec_v_top_hi_0 = _mm256_xor_si256(_mm256_add_epi16(_mm256_unpacklo_epi8(vec_v_top_fir_0, vec_v_top_sec_0), vec_sign_left_hi_0), vec_sign_left_hi_0);\n\
-                __m256i vec_v_bot_lo_0 = _mm256_xor_si256(_mm256_add_epi16(_mm256_unpackhi_epi8(vec_v_bot_fir_0, vec_v_bot_sec_0), vec_sign_right_lo_0), vec_sign_right_lo_0);\n\
-                __m256i vec_v_bot_hi_0 = _mm256_xor_si256(_mm256_add_epi16(_mm256_unpacklo_epi8(vec_v_bot_fir_0, vec_v_bot_sec_0), vec_sign_right_hi_0), vec_sign_right_hi_0);\n\
-                vec_c0 = _mm256_add_epi16(vec_c0, vec_v_top_hi_0);\n\
-                vec_c0 = _mm256_add_epi16(vec_c0, vec_v_bot_hi_0);\n\
-                vec_c1 = _mm256_add_epi16(vec_c1, vec_v_top_lo_0);\n\
-                vec_c1 = _mm256_add_epi16(vec_c1, vec_v_bot_lo_0);\n\
-                __m256i vec_a_1 = vec_as[k * 4 + 1];\n\
-                __m128i vec_k1_1 = _mm_loadu_si128(reinterpret_cast<__m128i*>(lut + k * 32 * 8 + 1 * 64 + 0  + K3 / 3 * 32 * bs));\n\
-                __m128i vec_k2_1 = _mm_loadu_si128(reinterpret_cast<__m128i*>(lut + k * 32 * 8 + 1 * 64 + 16 + K3 / 3 * 32 * bs));\n\
-                __m128i vec_k3_1 = _mm_loadu_si128(reinterpret_cast<__m128i*>(lut + k * 32 * 8 + 1 * 64 + 32 + K3 / 3 * 32 * bs));\n\
-                __m128i vec_k4_1 = _mm_loadu_si128(reinterpret_cast<__m128i*>(lut + k * 32 * 8 + 1 * 64 + 48 + K3 / 3 * 32 * bs));\n\
-                __m256i vec_sign_left_hi_1 = _mm256_srai_epi16(_mm256_slli_epi16(vec_sign, (4 * 1)), 15);\n\
-                __m256i vec_sign_left_lo_1 = _mm256_srai_epi16(_mm256_slli_epi16(vec_sign, (4 * 1 + 1)), 15);\n\
-                __m256i vec_v_top_1 = _mm256_and_si256(_mm256_srli_epi16(vec_a_1, 4), vec_mask);\n\
-                __m256i vec_v_top_fir_1 = _mm256_shuffle_epi8(_mm256_set_m128i(vec_k1_1, vec_k1_1), vec_v_top_1);\n\
-                __m256i vec_v_top_sec_1 = _mm256_shuffle_epi8(_mm256_set_m128i(vec_k2_1, vec_k2_1), vec_v_top_1);\n\
-                __m256i vec_sign_right_hi_1 = _mm256_srai_epi16(_mm256_slli_epi16(vec_sign, (4 * 1 + 2)), 15);\n\
-                __m256i vec_sign_right_lo_1 = _mm256_srai_epi16(_mm256_slli_epi16(vec_sign, (4 * 1 + 3)), 15);\n\
-                __m256i vec_v_bot_1 = _mm256_and_si256(vec_a_1, vec_mask);\n\
-                __m256i vec_v_bot_fir_1 = _mm256_shuffle_epi8(_mm256_set_m128i(vec_k3_1, vec_k3_1), vec_v_bot_1);\n\
-                __m256i vec_v_bot_sec_1 = _mm256_shuffle_epi8(_mm256_set_m128i(vec_k4_1, vec_k4_1), vec_v_bot_1);\n\
-                __m256i vec_v_top_lo_1 = _mm256_xor_si256(_mm256_add_epi16(_mm256_unpackhi_epi8(vec_v_top_fir_1, vec_v_top_sec_1), vec_sign_left_lo_1), vec_sign_left_lo_1);\n\
-                __m256i vec_v_top_hi_1 = _mm256_xor_si256(_mm256_add_epi16(_mm256_unpacklo_epi8(vec_v_top_fir_1, vec_v_top_sec_1), vec_sign_left_hi_1), vec_sign_left_hi_1);\n\
-                __m256i vec_v_bot_lo_1 = _mm256_xor_si256(_mm256_add_epi16(_mm256_unpackhi_epi8(vec_v_bot_fir_1, vec_v_bot_sec_1), vec_sign_right_lo_1), vec_sign_right_lo_1);\n\
-                __m256i vec_v_bot_hi_1 = _mm256_xor_si256(_mm256_add_epi16(_mm256_unpacklo_epi8(vec_v_bot_fir_1, vec_v_bot_sec_1), vec_sign_right_hi_1), vec_sign_right_hi_1);\n\
-                vec_c0 = _mm256_add_epi16(vec_c0, vec_v_top_hi_1);\n\
-                vec_c0 = _mm256_add_epi16(vec_c0, vec_v_bot_hi_1);\n\
-                vec_c1 = _mm256_add_epi16(vec_c1, vec_v_top_lo_1);\n\
-                vec_c1 = _mm256_add_epi16(vec_c1, vec_v_bot_lo_1);\n\
-                __m256i vec_a_2 = vec_as[k * 4 + 2];\n\
-                __m128i vec_k1_2 = _mm_loadu_si128(reinterpret_cast<__m128i*>(lut + k * 32 * 8 + 2 * 64 + 0  + K3 / 3 * 32 * bs));\n\
-                __m128i vec_k2_2 = _mm_loadu_si128(reinterpret_cast<__m128i*>(lut + k * 32 * 8 + 2 * 64 + 16 + K3 / 3 * 32 * bs));\n\
-                __m128i vec_k3_2 = _mm_loadu_si128(reinterpret_cast<__m128i*>(lut + k * 32 * 8 + 2 * 64 + 32 + K3 / 3 * 32 * bs));\n\
-                __m128i vec_k4_2 = _mm_loadu_si128(reinterpret_cast<__m128i*>(lut + k * 32 * 8 + 2 * 64 + 48 + K3 / 3 * 32 * bs));\n\
-                __m256i vec_sign_left_hi_2 = _mm256_srai_epi16(_mm256_slli_epi16(vec_sign, (4 * 2)), 15);\n\
-                __m256i vec_sign_left_lo_2 = _mm256_srai_epi16(_mm256_slli_epi16(vec_sign, (4 * 2 + 1)), 15);\n\
-                __m256i vec_v_top_2 = _mm256_and_si256(_mm256_srli_epi16(vec_a_2, 4), vec_mask);\n\
-                __m256i vec_v_top_fir_2 = _mm256_shuffle_epi8(_mm256_set_m128i(vec_k1_2, vec_k1_2), vec_v_top_2);\n\
-                __m256i vec_v_top_sec_2 = _mm256_shuffle_epi8(_mm256_set_m128i(vec_k2_2, vec_k2_2), vec_v_top_2);\n\
-                __m256i vec_sign_right_hi_2 = _mm256_srai_epi16(_mm256_slli_epi16(vec_sign, (4 * 2 + 2)), 15);\n\
-                __m256i vec_sign_right_lo_2 = _mm256_srai_epi16(_mm256_slli_epi16(vec_sign, (4 * 2 + 3)), 15);\n\
-                __m256i vec_v_bot_2 = _mm256_and_si256(vec_a_2, vec_mask);\n\
-                __m256i vec_v_bot_fir_2 = _mm256_shuffle_epi8(_mm256_set_m128i(vec_k3_2, vec_k3_2), vec_v_bot_2);\n\
-                __m256i vec_v_bot_sec_2 = _mm256_shuffle_epi8(_mm256_set_m128i(vec_k4_2, vec_k4_2), vec_v_bot_2);\n\
-                __m256i vec_v_top_lo_2 = _mm256_xor_si256(_mm256_add_epi16(_mm256_unpackhi_epi8(vec_v_top_fir_2, vec_v_top_sec_2), vec_sign_left_lo_2), vec_sign_left_lo_2);\n\
-                __m256i vec_v_top_hi_2 = _mm256_xor_si256(_mm256_add_epi16(_mm256_unpacklo_epi8(vec_v_top_fir_2, vec_v_top_sec_2), vec_sign_left_hi_2), vec_sign_left_hi_2);\n\
-                __m256i vec_v_bot_lo_2 = _mm256_xor_si256(_mm256_add_epi16(_mm256_unpackhi_epi8(vec_v_bot_fir_2, vec_v_bot_sec_2), vec_sign_right_lo_2), vec_sign_right_lo_2);\n\
-                __m256i vec_v_bot_hi_2 = _mm256_xor_si256(_mm256_add_epi16(_mm256_unpacklo_epi8(vec_v_bot_fir_2, vec_v_bot_sec_2), vec_sign_right_hi_2), vec_sign_right_hi_2);\n\
-                vec_c0 = _mm256_add_epi16(vec_c0, vec_v_top_hi_2);\n\
-                vec_c0 = _mm256_add_epi16(vec_c0, vec_v_bot_hi_2);\n\
-                vec_c1 = _mm256_add_epi16(vec_c1, vec_v_top_lo_2);\n\
-                vec_c1 = _mm256_add_epi16(vec_c1, vec_v_bot_lo_2);\n\
-                __m256i vec_a_3 = vec_as[k * 4 + 3];\n\
-                __m128i vec_k1_3 = _mm_loadu_si128(reinterpret_cast<__m128i*>(lut + k * 32 * 8 + 3 * 64 + 0  + K3 / 3 * 32 * bs));\n\
-                __m128i vec_k2_3 = _mm_loadu_si128(reinterpret_cast<__m128i*>(lut + k * 32 * 8 + 3 * 64 + 16 + K3 / 3 * 32 * bs));\n\
-                __m128i vec_k3_3 = _mm_loadu_si128(reinterpret_cast<__m128i*>(lut + k * 32 * 8 + 3 * 64 + 32 + K3 / 3 * 32 * bs));\n\
-                __m128i vec_k4_3 = _mm_loadu_si128(reinterpret_cast<__m128i*>(lut + k * 32 * 8 + 3 * 64 + 48 + K3 / 3 * 32 * bs));\n\
-                __m256i vec_sign_left_hi_3 = _mm256_srai_epi16(_mm256_slli_epi16(vec_sign, (4 * 3)), 15);\n\
-                __m256i vec_sign_left_lo_3 = _mm256_srai_epi16(_mm256_slli_epi16(vec_sign, (4 * 3 + 1)), 15);\n\
-                __m256i vec_v_top_3 = _mm256_and_si256(_mm256_srli_epi16(vec_a_3, 4), vec_mask);\n\
-                __m256i vec_v_top_fir_3 = _mm256_shuffle_epi8(_mm256_set_m128i(vec_k1_3, vec_k1_3), vec_v_top_3);\n\
-                __m256i vec_v_top_sec_3 = _mm256_shuffle_epi8(_mm256_set_m128i(vec_k2_3, vec_k2_3), vec_v_top_3);\n\
-                __m256i vec_sign_right_hi_3 = _mm256_srai_epi16(_mm256_slli_epi16(vec_sign, (4 * 3 + 2)), 15);\n\
-                __m256i vec_sign_right_lo_3 = _mm256_srai_epi16(_mm256_slli_epi16(vec_sign, (4 * 3 + 3)), 15);\n\
-                __m256i vec_v_bot_3 = _mm256_and_si256(vec_a_3, vec_mask);\n\
-                __m256i vec_v_bot_fir_3 = _mm256_shuffle_epi8(_mm256_set_m128i(vec_k3_3, vec_k3_3), vec_v_bot_3);\n\
-                __m256i vec_v_bot_sec_3 = _mm256_shuffle_epi8(_mm256_set_m128i(vec_k4_3, vec_k4_3), vec_v_bot_3);\n\
-                __m256i vec_v_top_lo_3 = _mm256_xor_si256(_mm256_add_epi16(_mm256_unpackhi_epi8(vec_v_top_fir_3, vec_v_top_sec_3), vec_sign_left_lo_3), vec_sign_left_lo_3);\n\
-                __m256i vec_v_top_hi_3 = _mm256_xor_si256(_mm256_add_epi16(_mm256_unpacklo_epi8(vec_v_top_fir_3, vec_v_top_sec_3), vec_sign_left_hi_3), vec_sign_left_hi_3);\n\
-                __m256i vec_v_bot_lo_3 = _mm256_xor_si256(_mm256_add_epi16(_mm256_unpackhi_epi8(vec_v_bot_fir_3, vec_v_bot_sec_3), vec_sign_right_lo_3), vec_sign_right_lo_3);\n\
-                __m256i vec_v_bot_hi_3 = _mm256_xor_si256(_mm256_add_epi16(_mm256_unpacklo_epi8(vec_v_bot_fir_3, vec_v_bot_sec_3), vec_sign_right_hi_3), vec_sign_right_hi_3);\n\
-                vec_c0 = _mm256_add_epi16(vec_c0, vec_v_top_hi_3);\n\
-                vec_c0 = _mm256_add_epi16(vec_c0, vec_v_bot_hi_3);\n\
-                vec_c1 = _mm256_add_epi16(vec_c1, vec_v_top_lo_3);\n\
-                vec_c1 = _mm256_add_epi16(vec_c1, vec_v_bot_lo_3);\n\
-        }}\n\
-        __m256i vec_gc0 = _mm256_loadu_si256(reinterpret_cast<__m256i*>(c + i      + BM{0} * bs));\n\
-        __m256i vec_gc1 = _mm256_loadu_si256(reinterpret_cast<__m256i*>(c + i + 8  + BM{0} * bs));\n\
-        __m256i vec_gc2 = _mm256_loadu_si256(reinterpret_cast<__m256i*>(c + i + 16 + BM{0} * bs));\n\
-        __m256i vec_gc3 = _mm256_loadu_si256(reinterpret_cast<__m256i*>(c + i + 24 + BM{0} * bs));\n\
-        vec_gc0 = _mm256_add_epi32(vec_gc0, _mm256_cvtepi16_epi32(_mm256_castsi256_si128(vec_c0)));\n\
-        vec_gc1 = _mm256_add_epi32(vec_gc1, _mm256_cvtepi16_epi32(_mm256_extracti128_si256(vec_c0, 1)));\n\
-        vec_gc2 = _mm256_add_epi32(vec_gc2, _mm256_cvtepi16_epi32(_mm256_castsi256_si128(vec_c1)));\n\
-        vec_gc3 = _mm256_add_epi32(vec_gc3, _mm256_cvtepi16_epi32(_mm256_extracti128_si256(vec_c1, 1)));\n\
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c + i      + BM{0} * bs), vec_gc0);\n\
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c + i + 8  + BM{0} * bs), vec_gc1);\n\
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c + i + 16 + BM{0} * bs), vec_gc2);\n\
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c + i + 24 + BM{0} * bs), vec_gc3);\n\
-    }}\n\
-    }}\n\
-#endif\n\
-}}\n\
-\n\
-template<int batch_size, int K2>\n\
-inline int32_t two_tbl_impl{0}(int32_t* c, int8_t* lut, uint8_t* a) {{\n\
-#ifdef __AVX2__\n\
-    const __m256i vec_mask = _mm256_set1_epi8(0x0f);\n\
-    const int KK = BK2 / 2;\n\
-#pragma unroll\n\
-    for (int i = 0; i < BM{0}; i += 32) {{\n\
-        __m256i vec_as[KK / 2];\n\
-        #pragma unroll\n\
-        for (int ai = 0; ai < KK / 2; ai++) {{\n\
-            vec_as[ai] = _mm256_loadu_si256(reinterpret_cast<__m256i*>(a + i * KK / 2 + ai * 32));\n\
-        }}\n\
-#pragma unroll\n\
-    for (int bs = 0; bs < batch_size; bs++) {{\n\
-        __m256i vec_c0 = _mm256_setzero_si256();\n\
-        __m256i vec_c1 = _mm256_setzero_si256();\n\
-#pragma unroll\n\
-        for (int k = 0; k < KK / 8; k++) {{\n\
-            #pragma unroll\n\
-            for (int j = 0; j < 4; j++) {{\n\
-                __m256i vec_a = vec_as[k * 4 + j];\n\
-\n\
-                __m128i vec_k1 = _mm_loadu_si128(reinterpret_cast<__m128i*>(lut + k * 32 * 8 + j * 64 + 0  + K2 / 2 * 32 * bs));\n\
-                __m128i vec_k2 = _mm_loadu_si128(reinterpret_cast<__m128i*>(lut + k * 32 * 8 + j * 64 + 16 + K2 / 2 * 32 * bs));\n\
-                __m128i vec_k3 = _mm_loadu_si128(reinterpret_cast<__m128i*>(lut + k * 32 * 8 + j * 64 + 32 + K2 / 2 * 32 * bs));\n\
-                __m128i vec_k4 = _mm_loadu_si128(reinterpret_cast<__m128i*>(lut + k * 32 * 8 + j * 64 + 48 + K2 / 2 * 32 * bs));\n\
-\n\
-                __m256i vec_v_top = _mm256_and_si256(_mm256_srli_epi16(vec_a, 4), vec_mask);\n\
-                __m256i vec_v_top_fir = _mm256_shuffle_epi8(_mm256_set_m128i(vec_k1, vec_k1), vec_v_top);\n\
-                __m256i vec_v_top_sec = _mm256_shuffle_epi8(_mm256_set_m128i(vec_k2, vec_k2), vec_v_top);\n\
-\n\
-                __m256i vec_v_bot = _mm256_and_si256(vec_a, vec_mask);\n\
-                __m256i vec_v_bot_fir = _mm256_shuffle_epi8(_mm256_set_m128i(vec_k3, vec_k3), vec_v_bot);\n\
-                __m256i vec_v_bot_sec = _mm256_shuffle_epi8(_mm256_set_m128i(vec_k4, vec_k4), vec_v_bot);\n\
-\n\
-                __m256i vec_v_top_lo = _mm256_unpackhi_epi8(vec_v_top_fir, vec_v_top_sec);\n\
-                __m256i vec_v_top_hi = _mm256_unpacklo_epi8(vec_v_top_fir, vec_v_top_sec);\n\
-                __m256i vec_v_bot_lo = _mm256_unpackhi_epi8(vec_v_bot_fir, vec_v_bot_sec);\n\
-                __m256i vec_v_bot_hi = _mm256_unpacklo_epi8(vec_v_bot_fir, vec_v_bot_sec);\n\
-                vec_c0 = _mm256_add_epi16(vec_c0, vec_v_top_hi);\n\
-                vec_c0 = _mm256_add_epi16(vec_c0, vec_v_bot_hi);\n\
-                vec_c1 = _mm256_add_epi16(vec_c1, vec_v_top_lo);\n\
-                vec_c1 = _mm256_add_epi16(vec_c1, vec_v_bot_lo); \n\
-            }}\n\
-        }}\n\
-\n\
-        __m256i vec_gc0 = _mm256_loadu_si256(reinterpret_cast<__m256i*>(c + i      + BM{0} * bs));\n\
-        __m256i vec_gc1 = _mm256_loadu_si256(reinterpret_cast<__m256i*>(c + i + 8  + BM{0} * bs));\n\
-        __m256i vec_gc2 = _mm256_loadu_si256(reinterpret_cast<__m256i*>(c + i + 16 + BM{0} * bs));\n\
-        __m256i vec_gc3 = _mm256_loadu_si256(reinterpret_cast<__m256i*>(c + i + 24 + BM{0} * bs));\n\
-\n\
-        vec_gc0 = _mm256_add_epi32(vec_gc0, _mm256_cvtepi16_epi32(_mm256_castsi256_si128(vec_c0)));\n\
-        vec_gc1 = _mm256_add_epi32(vec_gc1, _mm256_cvtepi16_epi32(_mm256_extracti128_si256(vec_c0, 1)));\n\
-        vec_gc2 = _mm256_add_epi32(vec_gc2, _mm256_cvtepi16_epi32(_mm256_castsi256_si128(vec_c1)));\n\
-        vec_gc3 = _mm256_add_epi32(vec_gc3, _mm256_cvtepi16_epi32(_mm256_extracti128_si256(vec_c1, 1)));\n\
-\n\
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c + i      + BM{0} * bs), vec_gc0);\n\
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c + i + 8  + BM{0} * bs), vec_gc1);\n\
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c + i + 16 + BM{0} * bs), vec_gc2);\n\
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c + i + 24 + BM{0} * bs), vec_gc3);\n\
-    }}\n\
-    }}\n\
-#endif\n\
-    return 0;\n\
-}}\n\
-\n\
-template<int BATCH_SIZE>\n\
-int32_t three_qgemm_lut_{0}(void* A, void* sign, void* LUT, void* Scales, void* LUT_Scales, void* C) {{\n\
-    alignas(32) uint32_t CBits[BATCH_SIZE * BM{0}];\n\
-    memset(&(CBits[0]), 0, BATCH_SIZE * BM{0} * sizeof(int32_t));\n\
-#pragma unroll\n\
-    for (int32_t k_outer = 0; k_outer < {1} / BBK{0}; ++k_outer) {{\n\
-        three_tbl_impl_{0}<BATCH_SIZE, {1}>((&(((int32_t*)CBits)[0])), (&(((int8_t*)LUT)[(k_outer * BBK{0} / 3 * 32)])), (&(((uint8_t*)A)[(k_outer * BBK{0} / 3 / 2 * BM{0})])), (&(((uint8_t*)sign)[(k_outer * BBK{0} / 3 / 8 * BM{0})])));\n\
-    }}\n\
-#pragma unroll\n\
-    for (int bs = 0; bs < BATCH_SIZE; bs++) {{\n\
-#pragma unroll\n\
-        for (int i = 0; i < BM{0}; i++) {{\n\
-            ((int32_t*)C)[i] = (int32_t)(((int32_t*)CBits)[i + bs * BM{0}]);\n\
-        }}\n\
-  }}\n\
-  return 0;\n\
-}}\n\
-\n\
-template<int BATCH_SIZE>\n\
-int32_t two_qgemm_lut_{0}(void* A, void* LUT, void* Scales, void* LUT_Scales, void* C) {{\n\
-    alignas(32) uint32_t CBits[BATCH_SIZE * BM{0}];\n\
-    memset(&(CBits[0]), 0, BATCH_SIZE * BM{0} * sizeof(int32_t));\n\
-#pragma unroll\n\
-    for (int32_t k_outer = 0; k_outer < {2} / 32; ++k_outer) {{\n\
-        two_tbl_impl{0}<BATCH_SIZE, {2}>((&(((int32_t*)CBits)[0])), (&(((int8_t*)LUT)[(k_outer * BK2 / 2 * 32)])), (&(((uint8_t*)A)[(k_outer * BK2 / 2 / 2 * BM{0})])));\n\
-    }}\n\
-#pragma unroll\n\
-    for (int bs = 0; bs < BATCH_SIZE; bs++) {{\n\
-#pragma unroll\n\
-        for (int i = 0; i < BM{0}; i++) {{\n\
-            ((int32_t*)C)[i] += (int32_t)(((int32_t*)CBits)[i + bs * BM{0}]);\n\
-            ((float*)C)[i] = (float)(((int32_t*)C)[i]) / ((float*)LUT_Scales)[bs] * ((float*)Scales)[0];\n\
-        }}\n\
-    }}\n\
-  return 0;\n\
-}}\n\
-\n\
-".format(pre, k_list[1], k_list[0])])
-    return kernel_code
+    # AVX512BW main loop (64 elements)
+    code += '#ifdef __AVX512BW__\n'
+    code += '    const __m512i vec_mask = _mm512_set1_epi8(0x0f);\n'
+    code += '    const int KK = BBK{} / 3;\n'.format(pre)
+    code += '    int i = 0;\n'
+    code += '    for (; i + 64 <= BM{}; i += 64) {{\n'.format(pre)
+    code += '        __m512i vec_as[KK / 2];\n'
+    code += '        __m512i vec_signs[KK / 8];\n'
+    code += '        #pragma unroll\n'
+    code += '        for (int ai = 0; ai < KK / 2; ai++) {\n'
+    code += '            vec_as[ai] = _mm512_loadu_si512(reinterpret_cast<__m512i*>(a + i * KK / 2 + ai * 64));\n'
+    code += '        }\n'
+    code += '        #pragma unroll\n'
+    code += '        for (int as = 0; as < KK / 8; as++) {\n'
+    code += '            vec_signs[as] = _mm512_loadu_si512(reinterpret_cast<__m512i*>(sign + i * KK / 8 + as * 64));\n'
+    code += '        }\n'
+    code += '#pragma unroll\n'
+    code += '    for (int bs = 0; bs < batch_size; bs++) {\n'
+    code += '        __m512i vec_c0 = _mm512_setzero_si512();\n'
+    code += '        __m512i vec_c1 = _mm512_setzero_si512();\n'
+    code += '#pragma unroll\n'
+    code += '        for (int k = 0; k < KK / 8; k++) {\n'
+    code += '            __m512i vec_sign = vec_signs[k];\n'
+    for j in range(4):
+        code += _gen_avx512_three_inner_block(j)
+    code += '        }\n'
+    # Store: 512-bit accumulators hold 32x16-bit values each. Widen to 32-bit.
+    # vec_c0 has 32 int16 values for positions 0..31 (low halves of pairs)
+    # vec_c1 has 32 int16 values for positions 32..63 (high halves of pairs)
+    # We need to widen each 256-bit half to 8x int32
+    code += '        // Widen 16-bit accumulators to 32-bit and store\n'
+    code += '        __m256i c0_lo = _mm512_castsi512_si256(vec_c0);\n'
+    code += '        __m256i c0_hi = _mm512_extracti64x4_epi64(vec_c0, 1);\n'
+    code += '        __m256i c1_lo = _mm512_castsi512_si256(vec_c1);\n'
+    code += '        __m256i c1_hi = _mm512_extracti64x4_epi64(vec_c1, 1);\n'
+    code += '        // First 32 elements (i+0..i+31)\n'
+    code += '        __m256i vec_gc0 = _mm256_loadu_si256(reinterpret_cast<__m256i*>(c + i      + BM{} * bs));\n'.format(pre)
+    code += '        __m256i vec_gc1 = _mm256_loadu_si256(reinterpret_cast<__m256i*>(c + i + 8  + BM{} * bs));\n'.format(pre)
+    code += '        __m256i vec_gc2 = _mm256_loadu_si256(reinterpret_cast<__m256i*>(c + i + 16 + BM{} * bs));\n'.format(pre)
+    code += '        __m256i vec_gc3 = _mm256_loadu_si256(reinterpret_cast<__m256i*>(c + i + 24 + BM{} * bs));\n'.format(pre)
+    code += '        vec_gc0 = _mm256_add_epi32(vec_gc0, _mm256_cvtepi16_epi32(_mm256_castsi256_si128(c0_lo)));\n'
+    code += '        vec_gc1 = _mm256_add_epi32(vec_gc1, _mm256_cvtepi16_epi32(_mm256_extracti128_si256(c0_lo, 1)));\n'
+    code += '        vec_gc2 = _mm256_add_epi32(vec_gc2, _mm256_cvtepi16_epi32(_mm256_castsi256_si128(c1_lo)));\n'
+    code += '        vec_gc3 = _mm256_add_epi32(vec_gc3, _mm256_cvtepi16_epi32(_mm256_extracti128_si256(c1_lo, 1)));\n'
+    code += '        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c + i      + BM{} * bs), vec_gc0);\n'.format(pre)
+    code += '        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c + i + 8  + BM{} * bs), vec_gc1);\n'.format(pre)
+    code += '        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c + i + 16 + BM{} * bs), vec_gc2);\n'.format(pre)
+    code += '        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c + i + 24 + BM{} * bs), vec_gc3);\n'.format(pre)
+    code += '        // Second 32 elements (i+32..i+63)\n'
+    code += '        __m256i vec_gc4 = _mm256_loadu_si256(reinterpret_cast<__m256i*>(c + i + 32 + BM{} * bs));\n'.format(pre)
+    code += '        __m256i vec_gc5 = _mm256_loadu_si256(reinterpret_cast<__m256i*>(c + i + 40 + BM{} * bs));\n'.format(pre)
+    code += '        __m256i vec_gc6 = _mm256_loadu_si256(reinterpret_cast<__m256i*>(c + i + 48 + BM{} * bs));\n'.format(pre)
+    code += '        __m256i vec_gc7 = _mm256_loadu_si256(reinterpret_cast<__m256i*>(c + i + 56 + BM{} * bs));\n'.format(pre)
+    code += '        vec_gc4 = _mm256_add_epi32(vec_gc4, _mm256_cvtepi16_epi32(_mm256_castsi256_si128(c0_hi)));\n'
+    code += '        vec_gc5 = _mm256_add_epi32(vec_gc5, _mm256_cvtepi16_epi32(_mm256_extracti128_si256(c0_hi, 1)));\n'
+    code += '        vec_gc6 = _mm256_add_epi32(vec_gc6, _mm256_cvtepi16_epi32(_mm256_castsi256_si128(c1_hi)));\n'
+    code += '        vec_gc7 = _mm256_add_epi32(vec_gc7, _mm256_cvtepi16_epi32(_mm256_extracti128_si256(c1_hi, 1)));\n'
+    code += '        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c + i + 32 + BM{} * bs), vec_gc4);\n'.format(pre)
+    code += '        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c + i + 40 + BM{} * bs), vec_gc5);\n'.format(pre)
+    code += '        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c + i + 48 + BM{} * bs), vec_gc6);\n'.format(pre)
+    code += '        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c + i + 56 + BM{} * bs), vec_gc7);\n'.format(pre)
+    code += '    }\n'
+    code += '    }\n'  # end batch loop
+
+    # AVX2 tail loop (32 elements)
+    code += '    // AVX2 tail for remaining 32-element blocks\n'
+    code += '    const __m256i vec_mask_256 = _mm256_set1_epi8(0x0f);\n'
+    code += '    for (; i < BM{}; i += 32) {{\n'.format(pre)
+    code += '        __m256i vec_as_t[KK / 2];\n'
+    code += '        __m256i vec_signs_t[KK / 8];\n'
+    code += '        #pragma unroll\n'
+    code += '        for (int ai = 0; ai < KK / 2; ai++) {\n'
+    code += '            vec_as_t[ai] = _mm256_loadu_si256(reinterpret_cast<__m256i*>(a + i * KK / 2 + ai * 32));\n'
+    code += '        }\n'
+    code += '        #pragma unroll\n'
+    code += '        for (int as = 0; as < KK / 8; as++) {\n'
+    code += '            vec_signs_t[as] = _mm256_loadu_si256(reinterpret_cast<__m256i*>(sign + i * KK / 8 + as * 32));\n'
+    code += '        }\n'
+    code += '#pragma unroll\n'
+    code += '    for (int bs = 0; bs < batch_size; bs++) {\n'
+    code += '        __m256i vec_c0 = _mm256_setzero_si256();\n'
+    code += '        __m256i vec_c1 = _mm256_setzero_si256();\n'
+    code += '#pragma unroll\n'
+    code += '        for (int k = 0; k < KK / 8; k++) {\n'
+    code += '            __m256i vec_sign = vec_signs_t[k];\n'
+    # Unrolled inner blocks for AVX2 tail
+    for j in range(4):
+        code += '                __m256i vec_a_{j} = vec_as_t[k * 4 + {j}];\n'.format(j=j)
+        code += '                __m128i vec_k1_{j} = _mm_loadu_si128(reinterpret_cast<__m128i*>(lut + k * 32 * 8 + {j} * 64 + 0  + K3 / 3 * 32 * bs));\n'.format(j=j)
+        code += '                __m128i vec_k2_{j} = _mm_loadu_si128(reinterpret_cast<__m128i*>(lut + k * 32 * 8 + {j} * 64 + 16 + K3 / 3 * 32 * bs));\n'.format(j=j)
+        code += '                __m128i vec_k3_{j} = _mm_loadu_si128(reinterpret_cast<__m128i*>(lut + k * 32 * 8 + {j} * 64 + 32 + K3 / 3 * 32 * bs));\n'.format(j=j)
+        code += '                __m128i vec_k4_{j} = _mm_loadu_si128(reinterpret_cast<__m128i*>(lut + k * 32 * 8 + {j} * 64 + 48 + K3 / 3 * 32 * bs));\n'.format(j=j)
+        code += '                __m256i vec_sign_left_hi_{j} = _mm256_srai_epi16(_mm256_slli_epi16(vec_sign, (4 * {j})), 15);\n'.format(j=j)
+        code += '                __m256i vec_sign_left_lo_{j} = _mm256_srai_epi16(_mm256_slli_epi16(vec_sign, (4 * {j} + 1)), 15);\n'.format(j=j)
+        code += '                __m256i vec_v_top_{j} = _mm256_and_si256(_mm256_srli_epi16(vec_a_{j}, 4), vec_mask_256);\n'.format(j=j)
+        code += '                __m256i vec_v_top_fir_{j} = _mm256_shuffle_epi8(_mm256_set_m128i(vec_k1_{j}, vec_k1_{j}), vec_v_top_{j});\n'.format(j=j)
+        code += '                __m256i vec_v_top_sec_{j} = _mm256_shuffle_epi8(_mm256_set_m128i(vec_k2_{j}, vec_k2_{j}), vec_v_top_{j});\n'.format(j=j)
+        code += '                __m256i vec_sign_right_hi_{j} = _mm256_srai_epi16(_mm256_slli_epi16(vec_sign, (4 * {j} + 2)), 15);\n'.format(j=j)
+        code += '                __m256i vec_sign_right_lo_{j} = _mm256_srai_epi16(_mm256_slli_epi16(vec_sign, (4 * {j} + 3)), 15);\n'.format(j=j)
+        code += '                __m256i vec_v_bot_{j} = _mm256_and_si256(vec_a_{j}, vec_mask_256);\n'.format(j=j)
+        code += '                __m256i vec_v_bot_fir_{j} = _mm256_shuffle_epi8(_mm256_set_m128i(vec_k3_{j}, vec_k3_{j}), vec_v_bot_{j});\n'.format(j=j)
+        code += '                __m256i vec_v_bot_sec_{j} = _mm256_shuffle_epi8(_mm256_set_m128i(vec_k4_{j}, vec_k4_{j}), vec_v_bot_{j});\n'.format(j=j)
+        code += '                __m256i vec_v_top_lo_{j} = _mm256_xor_si256(_mm256_add_epi16(_mm256_unpackhi_epi8(vec_v_top_fir_{j}, vec_v_top_sec_{j}), vec_sign_left_lo_{j}), vec_sign_left_lo_{j});\n'.format(j=j)
+        code += '                __m256i vec_v_top_hi_{j} = _mm256_xor_si256(_mm256_add_epi16(_mm256_unpacklo_epi8(vec_v_top_fir_{j}, vec_v_top_sec_{j}), vec_sign_left_hi_{j}), vec_sign_left_hi_{j});\n'.format(j=j)
+        code += '                __m256i vec_v_bot_lo_{j} = _mm256_xor_si256(_mm256_add_epi16(_mm256_unpackhi_epi8(vec_v_bot_fir_{j}, vec_v_bot_sec_{j}), vec_sign_right_lo_{j}), vec_sign_right_lo_{j});\n'.format(j=j)
+        code += '                __m256i vec_v_bot_hi_{j} = _mm256_xor_si256(_mm256_add_epi16(_mm256_unpacklo_epi8(vec_v_bot_fir_{j}, vec_v_bot_sec_{j}), vec_sign_right_hi_{j}), vec_sign_right_hi_{j});\n'.format(j=j)
+        code += '                vec_c0 = _mm256_add_epi16(vec_c0, vec_v_top_hi_{j});\n'.format(j=j)
+        code += '                vec_c0 = _mm256_add_epi16(vec_c0, vec_v_bot_hi_{j});\n'.format(j=j)
+        code += '                vec_c1 = _mm256_add_epi16(vec_c1, vec_v_top_lo_{j});\n'.format(j=j)
+        code += '                vec_c1 = _mm256_add_epi16(vec_c1, vec_v_bot_lo_{j});\n'.format(j=j)
+    code += '        }\n'
+    code += '        __m256i vec_gc0 = _mm256_loadu_si256(reinterpret_cast<__m256i*>(c + i      + BM{} * bs));\n'.format(pre)
+    code += '        __m256i vec_gc1 = _mm256_loadu_si256(reinterpret_cast<__m256i*>(c + i + 8  + BM{} * bs));\n'.format(pre)
+    code += '        __m256i vec_gc2 = _mm256_loadu_si256(reinterpret_cast<__m256i*>(c + i + 16 + BM{} * bs));\n'.format(pre)
+    code += '        __m256i vec_gc3 = _mm256_loadu_si256(reinterpret_cast<__m256i*>(c + i + 24 + BM{} * bs));\n'.format(pre)
+    code += '        vec_gc0 = _mm256_add_epi32(vec_gc0, _mm256_cvtepi16_epi32(_mm256_castsi256_si128(vec_c0)));\n'
+    code += '        vec_gc1 = _mm256_add_epi32(vec_gc1, _mm256_cvtepi16_epi32(_mm256_extracti128_si256(vec_c0, 1)));\n'
+    code += '        vec_gc2 = _mm256_add_epi32(vec_gc2, _mm256_cvtepi16_epi32(_mm256_castsi256_si128(vec_c1)));\n'
+    code += '        vec_gc3 = _mm256_add_epi32(vec_gc3, _mm256_cvtepi16_epi32(_mm256_extracti128_si256(vec_c1, 1)));\n'
+    code += '        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c + i      + BM{} * bs), vec_gc0);\n'.format(pre)
+    code += '        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c + i + 8  + BM{} * bs), vec_gc1);\n'.format(pre)
+    code += '        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c + i + 16 + BM{} * bs), vec_gc2);\n'.format(pre)
+    code += '        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c + i + 24 + BM{} * bs), vec_gc3);\n'.format(pre)
+    code += '    }\n'
+    code += '    }\n'  # end batch loop tail
+    code += '#endif\n'
+    code += '}\n\n'
+
+    # --- two_tbl_impl (keep as AVX2 — it's much less hot, BK2=32 is tiny) ---
+    code += 'template<int batch_size, int K2>\n'
+    code += 'inline int32_t two_tbl_impl{}(int32_t* c, int8_t* lut, uint8_t* a) {{\n'.format(pre)
+    code += '#ifdef __AVX2__\n'
+    code += '    const __m256i vec_mask = _mm256_set1_epi8(0x0f);\n'
+    code += '    const int KK = BK2 / 2;\n'
+    code += '#pragma unroll\n'
+    code += '    for (int i = 0; i < BM{}; i += 32) {{\n'.format(pre)
+    code += '        __m256i vec_as[KK / 2];\n'
+    code += '        #pragma unroll\n'
+    code += '        for (int ai = 0; ai < KK / 2; ai++) {\n'
+    code += '            vec_as[ai] = _mm256_loadu_si256(reinterpret_cast<__m256i*>(a + i * KK / 2 + ai * 32));\n'
+    code += '        }\n'
+    code += '#pragma unroll\n'
+    code += '    for (int bs = 0; bs < batch_size; bs++) {\n'
+    code += '        __m256i vec_c0 = _mm256_setzero_si256();\n'
+    code += '        __m256i vec_c1 = _mm256_setzero_si256();\n'
+    code += '#pragma unroll\n'
+    code += '        for (int k = 0; k < KK / 8; k++) {\n'
+    code += '            #pragma unroll\n'
+    code += '            for (int j = 0; j < 4; j++) {\n'
+    code += '                __m256i vec_a = vec_as[k * 4 + j];\n'
+    code += '                __m128i vec_k1 = _mm_loadu_si128(reinterpret_cast<__m128i*>(lut + k * 32 * 8 + j * 64 + 0  + K2 / 2 * 32 * bs));\n'
+    code += '                __m128i vec_k2 = _mm_loadu_si128(reinterpret_cast<__m128i*>(lut + k * 32 * 8 + j * 64 + 16 + K2 / 2 * 32 * bs));\n'
+    code += '                __m128i vec_k3 = _mm_loadu_si128(reinterpret_cast<__m128i*>(lut + k * 32 * 8 + j * 64 + 32 + K2 / 2 * 32 * bs));\n'
+    code += '                __m128i vec_k4 = _mm_loadu_si128(reinterpret_cast<__m128i*>(lut + k * 32 * 8 + j * 64 + 48 + K2 / 2 * 32 * bs));\n'
+    code += '                __m256i vec_v_top = _mm256_and_si256(_mm256_srli_epi16(vec_a, 4), vec_mask);\n'
+    code += '                __m256i vec_v_top_fir = _mm256_shuffle_epi8(_mm256_set_m128i(vec_k1, vec_k1), vec_v_top);\n'
+    code += '                __m256i vec_v_top_sec = _mm256_shuffle_epi8(_mm256_set_m128i(vec_k2, vec_k2), vec_v_top);\n'
+    code += '                __m256i vec_v_bot = _mm256_and_si256(vec_a, vec_mask);\n'
+    code += '                __m256i vec_v_bot_fir = _mm256_shuffle_epi8(_mm256_set_m128i(vec_k3, vec_k3), vec_v_bot);\n'
+    code += '                __m256i vec_v_bot_sec = _mm256_shuffle_epi8(_mm256_set_m128i(vec_k4, vec_k4), vec_v_bot);\n'
+    code += '                __m256i vec_v_top_lo = _mm256_unpackhi_epi8(vec_v_top_fir, vec_v_top_sec);\n'
+    code += '                __m256i vec_v_top_hi = _mm256_unpacklo_epi8(vec_v_top_fir, vec_v_top_sec);\n'
+    code += '                __m256i vec_v_bot_lo = _mm256_unpackhi_epi8(vec_v_bot_fir, vec_v_bot_sec);\n'
+    code += '                __m256i vec_v_bot_hi = _mm256_unpacklo_epi8(vec_v_bot_fir, vec_v_bot_sec);\n'
+    code += '                vec_c0 = _mm256_add_epi16(vec_c0, vec_v_top_hi);\n'
+    code += '                vec_c0 = _mm256_add_epi16(vec_c0, vec_v_bot_hi);\n'
+    code += '                vec_c1 = _mm256_add_epi16(vec_c1, vec_v_top_lo);\n'
+    code += '                vec_c1 = _mm256_add_epi16(vec_c1, vec_v_bot_lo);\n'
+    code += '            }\n'
+    code += '        }\n'
+    code += '        __m256i vec_gc0 = _mm256_loadu_si256(reinterpret_cast<__m256i*>(c + i      + BM{} * bs));\n'.format(pre)
+    code += '        __m256i vec_gc1 = _mm256_loadu_si256(reinterpret_cast<__m256i*>(c + i + 8  + BM{} * bs));\n'.format(pre)
+    code += '        __m256i vec_gc2 = _mm256_loadu_si256(reinterpret_cast<__m256i*>(c + i + 16 + BM{} * bs));\n'.format(pre)
+    code += '        __m256i vec_gc3 = _mm256_loadu_si256(reinterpret_cast<__m256i*>(c + i + 24 + BM{} * bs));\n'.format(pre)
+    code += '        vec_gc0 = _mm256_add_epi32(vec_gc0, _mm256_cvtepi16_epi32(_mm256_castsi256_si128(vec_c0)));\n'
+    code += '        vec_gc1 = _mm256_add_epi32(vec_gc1, _mm256_cvtepi16_epi32(_mm256_extracti128_si256(vec_c0, 1)));\n'
+    code += '        vec_gc2 = _mm256_add_epi32(vec_gc2, _mm256_cvtepi16_epi32(_mm256_castsi256_si128(vec_c1)));\n'
+    code += '        vec_gc3 = _mm256_add_epi32(vec_gc3, _mm256_cvtepi16_epi32(_mm256_extracti128_si256(vec_c1, 1)));\n'
+    code += '        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c + i      + BM{} * bs), vec_gc0);\n'.format(pre)
+    code += '        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c + i + 8  + BM{} * bs), vec_gc1);\n'.format(pre)
+    code += '        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c + i + 16 + BM{} * bs), vec_gc2);\n'.format(pre)
+    code += '        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c + i + 24 + BM{} * bs), vec_gc3);\n'.format(pre)
+    code += '    }\n'
+    code += '    }\n'
+    code += '#endif\n'
+    code += '    return 0;\n'
+    code += '}\n\n'
+
+    # --- three_qgemm_lut / two_qgemm_lut wrappers ---
+    three_k = k_list[1]
+    two_k = k_list[0]
+
+    code += 'template<int BATCH_SIZE>\n'
+    code += 'int32_t three_qgemm_lut_{}(void* A, void* sign, void* LUT, void* Scales, void* LUT_Scales, void* C) {{\n'.format(pre)
+    code += '    alignas(64) uint32_t CBits[BATCH_SIZE * BM{}];\n'.format(pre)
+    code += '    memset(&(CBits[0]), 0, BATCH_SIZE * BM{} * sizeof(int32_t));\n'.format(pre)
+    code += '#pragma unroll\n'
+    code += '    for (int32_t k_outer = 0; k_outer < {} / BBK{}; ++k_outer) {{\n'.format(three_k, pre)
+    code += '        three_tbl_impl_{}<BATCH_SIZE, {}>((&(((int32_t*)CBits)[0])), (&(((int8_t*)LUT)[(k_outer * BBK{} / 3 * 32)])), (&(((uint8_t*)A)[(k_outer * BBK{} / 3 / 2 * BM{})])), (&(((uint8_t*)sign)[(k_outer * BBK{} / 3 / 8 * BM{})])));\n'.format(pre, three_k, pre, pre, pre, pre, pre)
+    code += '    }\n'
+    code += '#pragma unroll\n'
+    code += '    for (int bs = 0; bs < BATCH_SIZE; bs++) {\n'
+    code += '#pragma unroll\n'
+    code += '        for (int i = 0; i < BM{}; i++) {{\n'.format(pre)
+    code += '            ((int32_t*)C)[i] = (int32_t)(((int32_t*)CBits)[i + bs * BM{}]);\n'.format(pre)
+    code += '        }\n'
+    code += '  }\n'
+    code += '  return 0;\n'
+    code += '}\n\n'
+
+    code += 'template<int BATCH_SIZE>\n'
+    code += 'int32_t two_qgemm_lut_{}(void* A, void* LUT, void* Scales, void* LUT_Scales, void* C) {{\n'.format(pre)
+    code += '    alignas(64) uint32_t CBits[BATCH_SIZE * BM{}];\n'.format(pre)
+    code += '    memset(&(CBits[0]), 0, BATCH_SIZE * BM{} * sizeof(int32_t));\n'.format(pre)
+    code += '#pragma unroll\n'
+    code += '    for (int32_t k_outer = 0; k_outer < {} / 32; ++k_outer) {{\n'.format(two_k)
+    code += '        two_tbl_impl{}<BATCH_SIZE, {}>((&(((int32_t*)CBits)[0])), (&(((int8_t*)LUT)[(k_outer * BK2 / 2 * 32)])), (&(((uint8_t*)A)[(k_outer * BK2 / 2 / 2 * BM{})])));\n'.format(pre, two_k, pre)
+    code += '    }\n'
+    code += '#pragma unroll\n'
+    code += '    for (int bs = 0; bs < BATCH_SIZE; bs++) {\n'
+    code += '#pragma unroll\n'
+    code += '        for (int i = 0; i < BM{}; i++) {{\n'.format(pre)
+    code += '            ((int32_t*)C)[i] += (int32_t)(((int32_t*)CBits)[i + bs * BM{}]);\n'.format(pre)
+    code += '            ((float*)C)[i] = (float)(((int32_t*)C)[i]) / ((float*)LUT_Scales)[bs] * ((float*)Scales)[0];\n'
+    code += '        }\n'
+    code += '    }\n'
+    code += '  return 0;\n'
+    code += '}\n\n'
+
+    return code
+
 
 def gen_top_api(kernel_shapes, k_list):
 
@@ -626,7 +645,7 @@ def gen_top_api(kernel_shapes, k_list):
 def gen_transform_code(kernel_shapes):
     kernel_code = "\n\
 void ggml_bitnet_transform_tensor(struct ggml_tensor * tensor) {\n\
-    if (!(is_type_supported(tensor->type) && tensor->backend == GGML_BACKEND_TYPE_CPU && tensor->extra == nullptr)) {\n\
+    if (!(is_type_supported(tensor->type) && tensor->extra == nullptr)) {\n\
         return;\n\
     }\n\
 \n\
@@ -690,11 +709,18 @@ if __name__ == "__main__":
         "Llama3-8B-1.58-100B-tokens"        : [[14336, 4096],
                                                [4096, 14336],
                                                [1024, 4096],
-                                               [4096, 4096]] 
+                                               [4096, 4096]],
+        "yoco-moe-30b-a3b-v3"              : [[8192, 3072],
+                                               [3072, 4096],
+                                               [1280, 3072],
+                                               [3072, 1280],
+                                               [1024, 3072],
+                                               [3072, 3072],
+                                               [128, 3072]]
     }
 
     parser = argparse.ArgumentParser(description='gen impl')
-    parser.add_argument('--model',default="input", type=str, dest="model", 
+    parser.add_argument('--model',default="input", type=str, dest="model",
                         help="choose from bitnet_b1_58-large/bitnet_b1_58-3B/Llama3-8B-1.58-100B-tokens.")
     parser.add_argument('--BM',default="input", type=str,
                         help="block length when cutting one weight (M, K) into M / BM weights (BM, K).")
@@ -722,7 +748,7 @@ if __name__ == "__main__":
         )
 
     assert(len(BM_list) == len(BK_list) == len(bm_list) == len(kernel_shapes)), "number of BM / BK / bm shoud be {}".format(len(kernel_shapes))
-    
+
     for i in range(len(kernel_shapes)):
         assert kernel_shapes[i][0] % BM_list[i] == 0, "M %% BM should be 0"
         assert (kernel_shapes[i][1] % BK_list[i]) % 32 == 0, "K %% BK %% 32 should be 0"
